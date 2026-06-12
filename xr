@@ -34,6 +34,7 @@ CONFIG_DIR = os.path.join(XDG_CONFIG, APP)
 SERVERS_FILE = os.path.join(CONFIG_DIR, "servers.json")
 STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
 GEN_CONFIG = os.path.join(CONFIG_DIR, "config.json")
+TUN_STATE_FILE = os.path.join(CONFIG_DIR, "tun.json")
 SYSTEMD_USER_DIR = os.path.join(XDG_CONFIG, "systemd", "user")
 UNIT_NAME = "xray-cli.service"
 UNIT_PATH = os.path.join(SYSTEMD_USER_DIR, UNIT_NAME)
@@ -567,6 +568,76 @@ def service_active() -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# TUN mode  (transparent / whole-system tunnel via tun2socks)
+# --------------------------------------------------------------------------- #
+# Approach mirrors v2rayN / NekoBox / sing-box on Linux:
+#   1. A TUN device (tun0, 198.18.0.1/15) captures all traffic.
+#   2. tun2socks forwards that traffic to our local SOCKS inbound (xray).
+#   3. A /32 bypass route sends xray's own connection to the proxy server out
+#      the real interface, so it doesn't loop back into the tunnel.
+#   4. 0.0.0.0/1 + 128.0.0.0/1 "split default" routes win over the real default
+#      without deleting it, so teardown is clean.
+# Everything that touches the kernel runs as one batched `sudo sh -c` so the
+# user is prompted for a password at most once.
+TUN_DEV = "tun0"
+TUN_ADDR = "198.18.0.1/15"
+TUN_UNIT = "xray-cli-tun"
+
+
+def tun2socks_bin() -> str | None:
+    return shutil.which("tun2socks")
+
+
+def default_route() -> tuple[str | None, str | None]:
+    """Return (interface, gateway) for the current IPv4 default route."""
+    if not shutil.which("ip"):
+        return None, None
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=4).stdout
+    except Exception:
+        return None, None
+    # e.g. "default via 192.168.1.1 dev wlan0 proto dhcp metric 600"
+    m = re.search(r"default(?:\s+via\s+(\S+))?\s+dev\s+(\S+)", out)
+    if not m:
+        return None, None
+    return m.group(2), m.group(1)
+
+
+def resolve_ips(host: str) -> list[str]:
+    """Resolve a host to IPv4 addresses (skip the tun subnet itself)."""
+    ips = set()
+    try:
+        for fam, *_ , sa in socket.getaddrinfo(host, None, socket.AF_INET):
+            ips.add(sa[0])
+    except Exception:
+        pass
+    return sorted(ips)
+
+
+def load_tun_state() -> dict:
+    try:
+        with open(TUN_STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def tun_active() -> bool:
+    if not _have_systemd():
+        return False
+    r = subprocess.run(["systemctl", "is-active", TUN_UNIT],
+                       capture_output=True, text=True)
+    return r.stdout.strip() == "active"
+
+
+def _run_root_script(script: str) -> int:
+    """Run a shell script as root via one sudo prompt."""
+    print(f"  {DIM}(requesting root via sudo for network setup…){RESET}")
+    return subprocess.run(["sudo", "sh", "-c", script]).returncode
+
+
+# --------------------------------------------------------------------------- #
 # Latency test (TCP connect time to server endpoint)
 # --------------------------------------------------------------------------- #
 def tcp_latency(host: str, port: int, timeout=3.0) -> float | None:
@@ -781,9 +852,11 @@ def cmd_status():
     running = service_active()
     ver = xray_version() or f"{RED}not installed{RESET}"
     dot = f"{GREEN}● connected{RESET}" if running else f"{DIM}○ stopped{RESET}"
+    tun = f"{GREEN}● on{RESET}" if tun_active() else f"{DIM}○ off{RESET}"
     lines = [
         f"{GRAY}status   {RESET}{dot}",
         f"{GRAY}server   {RESET}{style(active, BOLD) if active else DIM + 'none' + RESET}",
+        f"{GRAY}tun mode {RESET}{tun}",
         f"{GRAY}inbound  {RESET}socks5 {CYAN}{state['listen']}:{state['socks_port']}{RESET}  ·  "
         f"http {CYAN}{state['listen']}:{state['http_port']}{RESET}",
         f"{GRAY}xray     {RESET}{ver}",
@@ -865,6 +938,145 @@ def cmd_proxy(action: str):
         err("usage: proxy on|off")
 
 
+def cmd_tun(action: str):
+    if action == "status":
+        _tun_status()
+        return
+    if action == "off":
+        _tun_off()
+        return
+    if action != "on":
+        err("usage: tun on|off|status")
+        return
+    _tun_on()
+
+
+def _tun_status():
+    st = load_tun_state()
+    on = tun_active()
+    dot = f"{GREEN}● on{RESET}" if on else f"{DIM}○ off{RESET}"
+    iface, gw = default_route()
+    lines = [
+        f"{GRAY}tun mode {RESET}{dot}",
+        f"{GRAY}device   {RESET}{TUN_DEV}  {DIM}{TUN_ADDR}{RESET}",
+        f"{GRAY}via      {RESET}socks5 127.0.0.1:{load_state()['socks_port']} → tun2socks",
+        f"{GRAY}bypass   {RESET}{', '.join(st.get('bypass', [])) or DIM + 'none' + RESET}",
+        f"{GRAY}uplink   {RESET}{iface or '?'} {DIM}gw {gw or '?'}{RESET}",
+    ]
+    print(box(lines, title="tun", color=PURPLE))
+
+
+def _tun_on():
+    # 0. preconditions
+    if not require_xray():
+        return
+    if not tun2socks_bin():
+        err("tun2socks binary not found.")
+        print(box([
+            "TUN mode needs tun2socks (xjasonlyu). Install on Arch:",
+            f"  {CYAN}yay -S tun2socks{RESET}            {DIM}(AUR){RESET}",
+            f"  {CYAN}yay -S hev-socks5-tunnel{RESET}    {DIM}(alt, different binary){RESET}",
+        ], title="tun2socks not installed", color=YELLOW))
+        return
+    if not _have_systemd() or not shutil.which("ip"):
+        err("TUN mode requires systemd + iproute2 (Arch has both); not available here.")
+        return
+    state = load_state()
+    servers = load_servers()
+    server = next((s for s in servers if s["tag"] == state.get("active")), None)
+    if not server:
+        err("no active server — pick one with `xr use <name>`")
+        return
+    if not service_active():
+        info("xray service not running — starting it first…")
+        cmd_start()
+        if not service_active():
+            err("could not start xray; aborting tun setup")
+            return
+
+    iface, gw = default_route()
+    if not iface or not gw:
+        err("could not detect the default route / gateway; is the network up?")
+        return
+
+    with Spinner(f"resolving {server['address']}") as sp:
+        bypass = resolve_ips(server["address"])
+    if not bypass:
+        warn(f"could not resolve {server['address']} to an IPv4 address — "
+             "bypass route may be incomplete (continuing)")
+
+    socks = state["socks_port"]
+    t2s = tun2socks_bin()
+    bypass_cmds = "\n".join(
+        f"ip route replace {ip}/32 via {gw} dev {iface}" for ip in bypass)
+
+    script = f"""set -e
+# --- tun device ---
+ip tuntap add mode tun dev {TUN_DEV} 2>/dev/null || true
+ip addr replace {TUN_ADDR} dev {TUN_DEV}
+ip link set dev {TUN_DEV} up
+# --- relax reverse-path filtering so tun packets aren't dropped ---
+sysctl -wq net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+sysctl -wq net.ipv4.conf.{iface}.rp_filter=0 2>/dev/null || true
+# --- bypass: proxy server reachable directly (no loop) ---
+{bypass_cmds}
+# --- split default into tun (wins over real default, leaves it intact) ---
+ip route replace 0.0.0.0/1 dev {TUN_DEV}
+ip route replace 128.0.0.0/1 dev {TUN_DEV}
+# --- run tun2socks as a transient root service (journald-logged) ---
+systemctl reset-failed {TUN_UNIT} 2>/dev/null || true
+systemd-run --unit={TUN_UNIT} --collect --property=Restart=on-failure \\
+    {t2s} -device {TUN_DEV} -proxy socks5://127.0.0.1:{socks} -interface {iface}
+# --- DNS through the tunnel (back up the original once) ---
+[ -f /etc/resolv.conf.xrbak ] || cp /etc/resolv.conf /etc/resolv.conf.xrbak 2>/dev/null || true
+printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf
+"""
+    with Spinner("configuring tun device + routes (sudo)"):
+        rc = _run_root_script(script)
+    if rc != 0:
+        err("tun setup failed (see sudo/errors above)")
+        return
+    _ensure_dirs()
+    with open(TUN_STATE_FILE, "w") as f:
+        json.dump({"dev": TUN_DEV, "bypass": bypass, "iface": iface,
+                   "gw": gw, "server": server["tag"]}, f, indent=2)
+    time.sleep(0.5)
+    if tun_active():
+        ok(f"TUN mode {style('ON', GREEN, BOLD)} — whole system routed via "
+           f"{style(server['tag'], BOLD)}")
+        info("all apps now go through the tunnel; turn off with `xr tun off`")
+    else:
+        err("tun2socks did not come up — check `journalctl --user -u xray-cli-tun` "
+            "or `sudo systemctl status xray-cli-tun`")
+
+
+def _tun_off():
+    if not shutil.which("ip"):
+        warn("iproute2 not available")
+        return
+    st = load_tun_state()
+    bypass = st.get("bypass", [])
+    bypass_cmds = "\n".join(f"ip route del {ip}/32 2>/dev/null || true" for ip in bypass)
+    script = f"""set +e
+systemctl stop {TUN_UNIT} 2>/dev/null
+systemctl reset-failed {TUN_UNIT} 2>/dev/null
+ip route del 0.0.0.0/1 dev {TUN_DEV} 2>/dev/null
+ip route del 128.0.0.0/1 dev {TUN_DEV} 2>/dev/null
+{bypass_cmds}
+ip link set dev {TUN_DEV} down 2>/dev/null
+ip tuntap del mode tun dev {TUN_DEV} 2>/dev/null
+if [ -f /etc/resolv.conf.xrbak ]; then mv -f /etc/resolv.conf.xrbak /etc/resolv.conf; fi
+true
+"""
+    with Spinner("tearing down tun device + routes (sudo)"):
+        _run_root_script(script)
+    try:
+        os.remove(TUN_STATE_FILE)
+    except FileNotFoundError:
+        pass
+    ok(f"TUN mode {style('OFF', RED, BOLD)} — routing restored")
+
+
 def cmd_logs(follow=False):
     if not _have_systemd():
         warn("systemd not available; no journald logs")
@@ -905,6 +1117,7 @@ SLASH = {
     "/fastest": "test and switch to the fastest server",
     "/sub": "import a subscription URL  ·  /sub <url>",
     "/proxy": "system proxy  ·  /proxy on|off",
+    "/tun": "whole-system TUN tunnel  ·  /tun on|off|status",
     "/remove": "delete a server  ·  /remove <name|#>",
     "/logs": "show service logs",
     "/config": "print generated xray config",
@@ -1024,6 +1237,8 @@ def repl():
                 cmd_sub(args[0]) if args else warn("usage: /sub <url>")
             elif cmd == "/proxy":
                 cmd_proxy(args[0]) if args else warn("usage: /proxy on|off")
+            elif cmd == "/tun":
+                cmd_tun(args[0]) if args else cmd_tun("status")
             elif cmd == "/logs":
                 cmd_logs(follow=False)
             elif cmd == "/config":
@@ -1057,6 +1272,8 @@ def build_parser():
     sp.add_argument("url")
     sp = sub.add_parser("proxy", help="system proxy on|off")
     sp.add_argument("action", choices=["on", "off"])
+    tp = sub.add_parser("tun", help="whole-system TUN tunnel on|off|status")
+    tp.add_argument("action", choices=["on", "off", "status"], nargs="?", default="status")
     lp = sub.add_parser("logs", help="show service logs")
     lp.add_argument("-f", "--follow", action="store_true")
     sub.add_parser("config", help="print generated xray config")
@@ -1083,6 +1300,7 @@ def main(argv=None):
         "fastest": lambda: cmd_test(switch=True),
         "sub": lambda: cmd_sub(args.url),
         "proxy": lambda: cmd_proxy(args.action),
+        "tun": lambda: cmd_tun(args.action),
         "logs": lambda: cmd_logs(follow=args.follow),
         "config": cmd_config,
         "install-unit": write_unit,
