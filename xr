@@ -1,0 +1,1102 @@
+#!/usr/bin/env python3
+"""
+xr — a friendly CLI/TUI wrapper around Xray-core for Arch Linux.
+
+Single file, stdlib only. Manages saved servers (vless/vmess/trojan/ss),
+subscriptions, a systemd --user service, system proxy, and latency tests.
+
+Run `xr` with no args for the interactive Claude-Code-style shell, or use
+subcommands: `xr add <link>`, `xr start`, `xr status`, `xr test`, ...
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+import uuid as _uuid
+
+# --------------------------------------------------------------------------- #
+# Paths
+# --------------------------------------------------------------------------- #
+APP = "xray-cli"
+XDG_CONFIG = os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config"))
+CONFIG_DIR = os.path.join(XDG_CONFIG, APP)
+SERVERS_FILE = os.path.join(CONFIG_DIR, "servers.json")
+STATE_FILE = os.path.join(CONFIG_DIR, "state.json")
+GEN_CONFIG = os.path.join(CONFIG_DIR, "config.json")
+SYSTEMD_USER_DIR = os.path.join(XDG_CONFIG, "systemd", "user")
+UNIT_NAME = "xray-cli.service"
+UNIT_PATH = os.path.join(SYSTEMD_USER_DIR, UNIT_NAME)
+
+DEFAULTS = {
+    "socks_port": 10808,
+    "http_port": 10809,
+    "listen": "127.0.0.1",
+    "log_level": "warning",
+    "active": None,
+}
+
+# --------------------------------------------------------------------------- #
+# ANSI / UI helpers
+# --------------------------------------------------------------------------- #
+_NO_COLOR = bool(os.environ.get("NO_COLOR")) or not sys.stdout.isatty()
+
+
+def _c(code: str) -> str:
+    return "" if _NO_COLOR else code
+
+
+RESET = _c("\033[0m")
+BOLD = _c("\033[1m")
+DIM = _c("\033[2m")
+ITAL = _c("\033[3m")
+# palette (Claude-ish: warm orange accent, soft grays)
+ORANGE = _c("\033[38;5;209m")
+PURPLE = _c("\033[38;5;141m")
+GREEN = _c("\033[38;5;114m")
+RED = _c("\033[38;5;203m")
+YELLOW = _c("\033[38;5;221m")
+BLUE = _c("\033[38;5;110m")
+GRAY = _c("\033[38;5;245m")
+CYAN = _c("\033[38;5;116m")
+
+
+def style(text: str, *codes: str) -> str:
+    return "".join(codes) + text + RESET if codes else text
+
+
+def _vis_len(s: str) -> int:
+    return len(re.sub(r"\033\[[0-9;]*m", "", s))
+
+
+def box(lines, title=None, color=GRAY, width=None):
+    pad = 1
+    body = list(lines)
+    inner = max([_vis_len(l) for l in body] + [_vis_len(title or "")]) + pad * 2
+    if width:
+        inner = max(inner, width)
+    top = f"{color}╭─" + (f" {style(title, BOLD)}{color} " if title else "─") + "─" * (
+        inner - _vis_len(title or "") - (3 if title else 1)
+    ) + f"╮{RESET}"
+    out = [top]
+    for l in body:
+        gap = inner - _vis_len(l) - pad * 2
+        out.append(f"{color}│{RESET}" + " " * pad + l + " " * (gap + pad) + f"{color}│{RESET}")
+    out.append(f"{color}╰" + "─" * inner + f"╯{RESET}")
+    return "\n".join(out)
+
+
+def info(msg):
+    print(f"  {BLUE}•{RESET} {msg}")
+
+
+def ok(msg):
+    print(f"  {GREEN}✓{RESET} {msg}")
+
+
+def warn(msg):
+    print(f"  {YELLOW}!{RESET} {msg}")
+
+
+def err(msg):
+    print(f"  {RED}✗{RESET} {msg}")
+
+
+class Spinner:
+    FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+    def __init__(self, text=""):
+        self.text = text
+        self._stop = threading.Event()
+        self._t = None
+
+    def __enter__(self):
+        if _NO_COLOR:
+            print(f"  {self.text}…")
+            return self
+        self._t = threading.Thread(target=self._spin, daemon=True)
+        self._t.start()
+        return self
+
+    def _spin(self):
+        i = 0
+        while not self._stop.is_set():
+            f = self.FRAMES[i % len(self.FRAMES)]
+            sys.stdout.write(f"\r  {ORANGE}{f}{RESET} {self.text}…   ")
+            sys.stdout.flush()
+            i += 1
+            time.sleep(0.08)
+
+    def update(self, text):
+        self.text = text
+
+    def __exit__(self, *a):
+        self._stop.set()
+        if self._t:
+            self._t.join()
+        if not _NO_COLOR:
+            sys.stdout.write("\r" + " " * (len(self.text) + 12) + "\r")
+            sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------- #
+# Storage
+# --------------------------------------------------------------------------- #
+def _ensure_dirs():
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+
+def load_servers():
+    try:
+        with open(SERVERS_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_servers(servers):
+    _ensure_dirs()
+    with open(SERVERS_FILE, "w") as f:
+        json.dump(servers, f, indent=2)
+
+
+def load_state():
+    st = dict(DEFAULTS)
+    try:
+        with open(STATE_FILE) as f:
+            st.update(json.load(f))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    return st
+
+
+def save_state(state):
+    _ensure_dirs()
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def find_server(servers, ref):
+    """Find by tag (exact), then by 1-based index, then by substring."""
+    for s in servers:
+        if s["tag"] == ref:
+            return s
+    if ref.isdigit():
+        i = int(ref) - 1
+        if 0 <= i < len(servers):
+            return servers[i]
+    matches = [s for s in servers if ref.lower() in s["tag"].lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _unique_tag(servers, tag):
+    tag = tag or "server"
+    existing = {s["tag"] for s in servers}
+    if tag not in existing:
+        return tag
+    n = 2
+    while f"{tag}-{n}" in existing:
+        n += 1
+    return f"{tag}-{n}"
+
+
+# --------------------------------------------------------------------------- #
+# Base64 helpers
+# --------------------------------------------------------------------------- #
+def _b64decode(s: str) -> bytes:
+    s = s.strip().replace("-", "+").replace("_", "/")
+    s += "=" * (-len(s) % 4)
+    return base64.b64decode(s)
+
+
+# --------------------------------------------------------------------------- #
+# Share-link parsing  ->  normalized server dict
+# --------------------------------------------------------------------------- #
+def parse_link(link: str) -> dict | None:
+    link = link.strip()
+    if link.startswith("vless://"):
+        return _parse_vless(link)
+    if link.startswith("vmess://"):
+        return _parse_vmess(link)
+    if link.startswith("trojan://"):
+        return _parse_trojan(link)
+    if link.startswith("ss://"):
+        return _parse_ss(link)
+    return None
+
+
+def _qs(query: str) -> dict:
+    return {k: v[0] for k, v in urllib.parse.parse_qs(query).items()}
+
+
+def _name_from_fragment(frag: str, fallback: str) -> str:
+    return urllib.parse.unquote(frag) if frag else fallback
+
+
+def _parse_vless(link):
+    u = urllib.parse.urlparse(link)
+    q = _qs(u.query)
+    return {
+        "protocol": "vless",
+        "tag": _name_from_fragment(u.fragment, f"{u.hostname}:{u.port}"),
+        "address": u.hostname,
+        "port": int(u.port or 443),
+        "id": urllib.parse.unquote(u.username or ""),
+        "flow": q.get("flow", ""),
+        "encryption": q.get("encryption", "none"),
+        "stream": _stream_from_query(q),
+        "raw": link,
+    }
+
+
+def _parse_vmess(link):
+    try:
+        data = json.loads(_b64decode(link[len("vmess://"):]).decode("utf-8", "replace"))
+    except Exception:
+        return None
+    net = data.get("net", "tcp")
+    q = {
+        "type": net,
+        "security": "tls" if str(data.get("tls", "")) in ("tls", "1", "true") else "none",
+        "sni": data.get("sni", "") or data.get("host", ""),
+        "host": data.get("host", ""),
+        "path": data.get("path", ""),
+        "serviceName": data.get("path", "") if net == "grpc" else "",
+        "headerType": data.get("type", ""),
+        "alpn": data.get("alpn", ""),
+        "fp": data.get("fp", ""),
+    }
+    return {
+        "protocol": "vmess",
+        "tag": data.get("ps") or f"{data.get('add')}:{data.get('port')}",
+        "address": data.get("add"),
+        "port": int(data.get("port") or 443),
+        "id": data.get("id"),
+        "alterId": int(data.get("aid") or 0),
+        "security": data.get("scy", "auto"),
+        "stream": _stream_from_query(q),
+        "raw": link,
+    }
+
+
+def _parse_trojan(link):
+    u = urllib.parse.urlparse(link)
+    q = _qs(u.query)
+    q.setdefault("security", "tls")
+    return {
+        "protocol": "trojan",
+        "tag": _name_from_fragment(u.fragment, f"{u.hostname}:{u.port}"),
+        "address": u.hostname,
+        "port": int(u.port or 443),
+        "password": urllib.parse.unquote(u.username or ""),
+        "stream": _stream_from_query(q),
+        "raw": link,
+    }
+
+
+def _parse_ss(link):
+    rest = link[len("ss://"):]
+    frag = ""
+    if "#" in rest:
+        rest, frag = rest.split("#", 1)
+    # Form A: ss://base64(method:pass@host:port)
+    # Form B: ss://base64(method:pass)@host:port
+    method = password = host = None
+    port = None
+    if "@" in rest:
+        userinfo, hostpart = rest.rsplit("@", 1)
+        try:
+            method, password = _b64decode(userinfo).decode("utf-8", "replace").split(":", 1)
+        except Exception:
+            if ":" in userinfo:
+                method, password = urllib.parse.unquote(userinfo).split(":", 1)
+        host, _, p = hostpart.partition(":")
+        port = int(p.split("?")[0].split("/")[0]) if p else 8388
+    else:
+        try:
+            decoded = _b64decode(rest.split("?")[0]).decode("utf-8", "replace")
+            creds, hostpart = decoded.rsplit("@", 1)
+            method, password = creds.split(":", 1)
+            host, _, p = hostpart.partition(":")
+            port = int(p) if p else 8388
+        except Exception:
+            return None
+    if not host:
+        return None
+    return {
+        "protocol": "shadowsocks",
+        "tag": _name_from_fragment(frag, f"{host}:{port}"),
+        "address": host,
+        "port": port,
+        "method": method,
+        "password": password,
+        "stream": {"network": "tcp", "security": "none"},
+        "raw": link,
+    }
+
+
+def _stream_from_query(q: dict) -> dict:
+    net = q.get("type", "tcp") or "tcp"
+    if net == "h2":
+        net = "http"
+    sec = q.get("security", "none") or "none"
+    s = {"network": net, "security": sec}
+    if sec == "tls":
+        s["tls"] = {
+            "sni": q.get("sni") or q.get("host") or "",
+            "fp": q.get("fp", ""),
+            "alpn": [a for a in (q.get("alpn") or "").split(",") if a],
+        }
+    elif sec == "reality":
+        s["reality"] = {
+            "sni": q.get("sni", ""),
+            "fp": q.get("fp", "chrome"),
+            "pbk": q.get("pbk", ""),
+            "sid": q.get("sid", ""),
+            "spx": q.get("spx", ""),
+        }
+    if net == "ws":
+        s["ws"] = {"path": q.get("path", "/"), "host": q.get("host", "")}
+    elif net == "grpc":
+        s["grpc"] = {
+            "serviceName": q.get("serviceName") or q.get("path", ""),
+            "multiMode": q.get("mode", "") == "multi",
+        }
+    elif net in ("http", "h2"):
+        s["http"] = {
+            "path": q.get("path", "/"),
+            "host": [h for h in (q.get("host") or "").split(",") if h],
+        }
+    elif net == "tcp" and q.get("headerType") == "http":
+        s["tcp_http"] = {"path": q.get("path", "/"), "host": q.get("host", "")}
+    return s
+
+
+# --------------------------------------------------------------------------- #
+# Xray config generation
+# --------------------------------------------------------------------------- #
+def _stream_settings(stream: dict) -> dict:
+    net = stream.get("network", "tcp")
+    ss = {"network": net, "security": stream.get("security", "none")}
+    sec = stream.get("security", "none")
+    if sec == "tls" and "tls" in stream:
+        t = stream["tls"]
+        ss["tlsSettings"] = {k: v for k, v in {
+            "serverName": t.get("sni"),
+            "fingerprint": t.get("fp"),
+            "alpn": t.get("alpn") or None,
+            "allowInsecure": False,
+        }.items() if v}
+    elif sec == "reality" and "reality" in stream:
+        r = stream["reality"]
+        ss["realitySettings"] = {k: v for k, v in {
+            "serverName": r.get("sni"),
+            "fingerprint": r.get("fp") or "chrome",
+            "publicKey": r.get("pbk"),
+            "shortId": r.get("sid"),
+            "spiderX": r.get("spx"),
+        }.items() if v}
+    if net == "ws":
+        w = stream.get("ws", {})
+        ss["wsSettings"] = {"path": w.get("path", "/")}
+        if w.get("host"):
+            ss["wsSettings"]["headers"] = {"Host": w["host"]}
+    elif net == "grpc":
+        g = stream.get("grpc", {})
+        ss["grpcSettings"] = {"serviceName": g.get("serviceName", ""),
+                              "multiMode": bool(g.get("multiMode"))}
+    elif net in ("http", "h2"):
+        h = stream.get("http", {})
+        ss["network"] = "http"
+        ss["httpSettings"] = {"path": h.get("path", "/"), "host": h.get("host", [])}
+    elif net == "tcp" and "tcp_http" in stream:
+        h = stream["tcp_http"]
+        ss["tcpSettings"] = {
+            "header": {"type": "http",
+                       "request": {"path": [h.get("path", "/")],
+                                   "headers": {"Host": [h.get("host", "")]}}}
+        }
+    return ss
+
+
+def build_outbound(server: dict) -> dict:
+    proto = server["protocol"]
+    stream = _stream_settings(server.get("stream", {"network": "tcp", "security": "none"}))
+    ob = {"tag": "proxy", "protocol": proto, "streamSettings": stream}
+    if proto == "vless":
+        user = {"id": server["id"], "encryption": server.get("encryption", "none")}
+        if server.get("flow"):
+            user["flow"] = server["flow"]
+        ob["settings"] = {"vnext": [{"address": server["address"],
+                                     "port": server["port"], "users": [user]}]}
+    elif proto == "vmess":
+        ob["settings"] = {"vnext": [{"address": server["address"], "port": server["port"],
+                                     "users": [{"id": server["id"],
+                                                "alterId": server.get("alterId", 0),
+                                                "security": server.get("security", "auto")}]}]}
+    elif proto == "trojan":
+        ob["settings"] = {"servers": [{"address": server["address"], "port": server["port"],
+                                       "password": server["password"]}]}
+    elif proto == "shadowsocks":
+        ob["settings"] = {"servers": [{"address": server["address"], "port": server["port"],
+                                       "method": server["method"],
+                                       "password": server["password"]}]}
+    return ob
+
+
+def build_config(server: dict, state: dict) -> dict:
+    listen = state.get("listen", "127.0.0.1")
+    return {
+        "log": {"loglevel": state.get("log_level", "warning")},
+        "inbounds": [
+            {"tag": "socks", "listen": listen, "port": state["socks_port"],
+             "protocol": "socks",
+             "settings": {"udp": True, "auth": "noauth"},
+             "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]}},
+            {"tag": "http", "listen": listen, "port": state["http_port"],
+             "protocol": "http", "settings": {}},
+        ],
+        "outbounds": [
+            build_outbound(server),
+            {"tag": "direct", "protocol": "freedom", "settings": {}},
+            {"tag": "block", "protocol": "blackhole", "settings": {}},
+        ],
+        "routing": {
+            "domainStrategy": "IPIfNonMatch",
+            "rules": [
+                {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+            ],
+        },
+    }
+
+
+def write_active_config(servers, state) -> dict | None:
+    tag = state.get("active")
+    if not tag:
+        return None
+    server = next((s for s in servers if s["tag"] == tag), None)
+    if not server:
+        return None
+    cfg = build_config(server, state)
+    _ensure_dirs()
+    with open(GEN_CONFIG, "w") as f:
+        json.dump(cfg, f, indent=2)
+    return server
+
+
+# --------------------------------------------------------------------------- #
+# Xray binary
+# --------------------------------------------------------------------------- #
+def xray_bin() -> str | None:
+    return shutil.which("xray")
+
+
+def xray_version() -> str | None:
+    b = xray_bin()
+    if not b:
+        return None
+    try:
+        out = subprocess.run([b, "version"], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip().splitlines()[0] if out.stdout else None
+    except Exception:
+        return None
+
+
+def require_xray() -> bool:
+    if xray_bin():
+        return True
+    err("xray binary not found.")
+    print(box([
+        f"Install on Arch with one of:",
+        f"  {CYAN}sudo pacman -S xray{RESET}        {DIM}(community repo){RESET}",
+        f"  {CYAN}yay -S xray-bin{RESET}            {DIM}(AUR){RESET}",
+    ], title="xray not installed", color=YELLOW))
+    return False
+
+
+# --------------------------------------------------------------------------- #
+# systemd --user
+# --------------------------------------------------------------------------- #
+def _have_systemd() -> bool:
+    return shutil.which("systemctl") is not None
+
+
+def _systemctl(*args, capture=False):
+    return subprocess.run(["systemctl", "--user", *args],
+                          capture_output=capture, text=True)
+
+
+def write_unit():
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    unit = f"""[Unit]
+Description=xray-cli managed Xray-core instance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={xray_bin() or '/usr/bin/xray'} run -config {GEN_CONFIG}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=51200
+
+[Install]
+WantedBy=default.target
+"""
+    with open(UNIT_PATH, "w") as f:
+        f.write(unit)
+    if _have_systemd():
+        _systemctl("daemon-reload")
+
+
+def service_active() -> bool:
+    if not _have_systemd():
+        return False
+    r = _systemctl("is-active", UNIT_NAME, capture=True)
+    return r.stdout.strip() == "active"
+
+
+# --------------------------------------------------------------------------- #
+# Latency test (TCP connect time to server endpoint)
+# --------------------------------------------------------------------------- #
+def tcp_latency(host: str, port: int, timeout=3.0) -> float | None:
+    try:
+        start = time.perf_counter()
+        with socket.create_connection((host, port), timeout=timeout):
+            return (time.perf_counter() - start) * 1000.0
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Subscription fetch
+# --------------------------------------------------------------------------- #
+def fetch_subscription(url: str) -> list[str]:
+    req = urllib.request.Request(url, headers={"User-Agent": "xray-cli/1.0"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        body = r.read()
+    text = body.decode("utf-8", "replace").strip()
+    # subscription bodies are usually base64 of newline-joined links
+    try:
+        decoded = _b64decode(text).decode("utf-8", "replace")
+        if "://" in decoded:
+            text = decoded
+    except Exception:
+        pass
+    return [ln.strip() for ln in text.splitlines() if "://" in ln]
+
+
+# --------------------------------------------------------------------------- #
+# System proxy
+# --------------------------------------------------------------------------- #
+ENV_PROXY_FILE = os.path.join(CONFIG_DIR, "proxy.env")
+
+
+def _gsettings(*args) -> bool:
+    if not shutil.which("gsettings"):
+        return False
+    try:
+        subprocess.run(["gsettings", *args], check=True, capture_output=True)
+        return True
+    except Exception:
+        return False
+
+
+def proxy_on(state):
+    host = state.get("listen", "127.0.0.1")
+    hp = state["http_port"]
+    sp = state["socks_port"]
+    _ensure_dirs()
+    with open(ENV_PROXY_FILE, "w") as f:
+        f.write(f"export http_proxy=http://{host}:{hp}\n"
+                f"export https_proxy=http://{host}:{hp}\n"
+                f"export all_proxy=socks5://{host}:{sp}\n"
+                f"export HTTP_PROXY=http://{host}:{hp}\n"
+                f"export HTTPS_PROXY=http://{host}:{hp}\n"
+                f"export ALL_PROXY=socks5://{host}:{sp}\n")
+    g = False
+    if _gsettings("set", "org.gnome.system.proxy", "mode", "manual"):
+        _gsettings("set", "org.gnome.system.proxy.http", "host", host)
+        _gsettings("set", "org.gnome.system.proxy.http", "port", str(hp))
+        _gsettings("set", "org.gnome.system.proxy.https", "host", host)
+        _gsettings("set", "org.gnome.system.proxy.https", "port", str(hp))
+        _gsettings("set", "org.gnome.system.proxy.socks", "host", host)
+        _gsettings("set", "org.gnome.system.proxy.socks", "port", str(sp))
+        g = True
+    return g
+
+
+def proxy_off():
+    g = _gsettings("set", "org.gnome.system.proxy", "mode", "none")
+    try:
+        os.remove(ENV_PROXY_FILE)
+    except FileNotFoundError:
+        pass
+    return g
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+# --------------------------------------------------------------------------- #
+def cmd_add(links: list[str]):
+    servers = load_servers()
+    added = 0
+    for link in links:
+        s = parse_link(link)
+        if not s:
+            err(f"could not parse: {link[:48]}…")
+            continue
+        s["tag"] = _unique_tag(servers, s["tag"])
+        servers.append(s)
+        added += 1
+        ok(f"added {style(s['tag'], BOLD)} {DIM}({s['protocol']} → {s['address']}:{s['port']}){RESET}")
+    if added:
+        save_servers(servers)
+        if len(servers) == added and added == 1:
+            st = load_state()
+            st["active"] = servers[0]["tag"]
+            save_state(st)
+            info(f"set active server to {style(servers[0]['tag'], BOLD)}")
+    return added
+
+
+def cmd_list():
+    servers = load_servers()
+    state = load_state()
+    if not servers:
+        warn("no servers yet — add one with " + style("xr add <link>", CYAN))
+        return
+    rows = []
+    for i, s in enumerate(servers, 1):
+        active = s["tag"] == state.get("active")
+        mark = f"{GREEN}●{RESET}" if active else f"{DIM}○{RESET}"
+        proto = f"{PURPLE}{s['protocol']:<11}{RESET}"
+        sec = s.get("stream", {}).get("security", "none")
+        net = s.get("stream", {}).get("network", "tcp")
+        name = style(s["tag"], BOLD) if active else s["tag"]
+        rows.append(f"{mark} {GRAY}{i:>2}{RESET}  {proto} {name}")
+        rows.append(f"      {DIM}{s['address']}:{s['port']}  ·  {net}/{sec}{RESET}")
+    print(box(rows, title=f"servers ({len(servers)})", color=GRAY))
+
+
+def cmd_use(ref: str):
+    servers = load_servers()
+    s = find_server(servers, ref)
+    if not s:
+        err(f"no server matching '{ref}'")
+        return False
+    state = load_state()
+    state["active"] = s["tag"]
+    save_state(state)
+    ok(f"active server → {style(s['tag'], BOLD)}")
+    if service_active():
+        info("restarting service to apply…")
+        cmd_restart()
+    return True
+
+
+def cmd_remove(ref: str):
+    servers = load_servers()
+    s = find_server(servers, ref)
+    if not s:
+        err(f"no server matching '{ref}'")
+        return
+    servers = [x for x in servers if x["tag"] != s["tag"]]
+    save_servers(servers)
+    state = load_state()
+    if state.get("active") == s["tag"]:
+        state["active"] = servers[0]["tag"] if servers else None
+        save_state(state)
+    ok(f"removed {style(s['tag'], BOLD)}")
+
+
+def cmd_start():
+    if not require_xray():
+        return
+    servers = load_servers()
+    state = load_state()
+    if not state.get("active"):
+        if not servers:
+            warn("no servers to start — add one first")
+            return
+        state["active"] = servers[0]["tag"]
+        save_state(state)
+    server = write_active_config(servers, state)
+    if not server:
+        err("active server is missing; pick one with `xr use <name>`")
+        return
+    write_unit()
+    if not _have_systemd():
+        warn("systemd not available here — run manually:")
+        print(f"    {CYAN}xray run -config {GEN_CONFIG}{RESET}")
+        return
+    with Spinner(f"starting xray → {server['tag']}"):
+        _systemctl("enable", "--now", UNIT_NAME, capture=True)
+        time.sleep(0.6)
+    if service_active():
+        ok(f"connected via {style(server['tag'], BOLD)} "
+           f"{DIM}(socks {state['socks_port']} · http {state['http_port']}){RESET}")
+    else:
+        err("service failed to start — check `xr logs`")
+
+
+def cmd_stop():
+    if not _have_systemd():
+        warn("systemd not available")
+        return
+    with Spinner("stopping xray"):
+        _systemctl("disable", "--now", UNIT_NAME, capture=True)
+        time.sleep(0.4)
+    ok("stopped")
+
+
+def cmd_restart():
+    servers = load_servers()
+    state = load_state()
+    write_active_config(servers, state)
+    write_unit()
+    if not _have_systemd():
+        warn("systemd not available")
+        return
+    with Spinner("restarting xray"):
+        _systemctl("restart", UNIT_NAME, capture=True)
+        time.sleep(0.6)
+    ok("restarted" if service_active() else "restart failed — check `xr logs`")
+
+
+def cmd_status():
+    state = load_state()
+    servers = load_servers()
+    active = state.get("active")
+    running = service_active()
+    ver = xray_version() or f"{RED}not installed{RESET}"
+    dot = f"{GREEN}● connected{RESET}" if running else f"{DIM}○ stopped{RESET}"
+    lines = [
+        f"{GRAY}status   {RESET}{dot}",
+        f"{GRAY}server   {RESET}{style(active, BOLD) if active else DIM + 'none' + RESET}",
+        f"{GRAY}inbound  {RESET}socks5 {CYAN}{state['listen']}:{state['socks_port']}{RESET}  ·  "
+        f"http {CYAN}{state['listen']}:{state['http_port']}{RESET}",
+        f"{GRAY}xray     {RESET}{ver}",
+        f"{GRAY}saved    {RESET}{len(servers)} server(s)",
+    ]
+    print(box(lines, title="xray-cli", color=ORANGE))
+
+
+def cmd_test(switch=False):
+    servers = load_servers()
+    if not servers:
+        warn("no servers to test")
+        return
+    results = []
+    with Spinner("probing servers") as sp:
+        for s in servers:
+            sp.update(f"probing {s['tag']}")
+            ms = tcp_latency(s["address"], s["port"])
+            results.append((s, ms))
+    results.sort(key=lambda r: (r[1] is None, r[1] if r[1] is not None else 9e9))
+    rows = []
+    state = load_state()
+    for s, ms in results:
+        if ms is None:
+            badge = f"{RED}timeout{RESET}"
+        elif ms < 150:
+            badge = f"{GREEN}{ms:6.0f} ms{RESET}"
+        elif ms < 400:
+            badge = f"{YELLOW}{ms:6.0f} ms{RESET}"
+        else:
+            badge = f"{RED}{ms:6.0f} ms{RESET}"
+        cur = f" {GREEN}(active){RESET}" if s["tag"] == state.get("active") else ""
+        rows.append(f"{badge}  {s['tag']}{cur}")
+    print(box(rows, title="latency", color=GRAY))
+    if switch:
+        best = next((s for s, ms in results if ms is not None), None)
+        if best and best["tag"] != state.get("active"):
+            cmd_use(best["tag"])
+        elif best:
+            info(f"already on the fastest server ({best['tag']})")
+
+
+def cmd_sub(url: str):
+    with Spinner("fetching subscription"):
+        try:
+            links = fetch_subscription(url)
+        except Exception as e:
+            links = None
+            error = e
+    if links is None:
+        err(f"fetch failed: {error}")
+        return
+    if not links:
+        warn("subscription returned no servers")
+        return
+    info(f"got {len(links)} server(s)")
+    n = cmd_add(links)
+    state = load_state()
+    subs = state.setdefault("subscriptions", [])
+    if url not in subs:
+        subs.append(url)
+        save_state(state)
+    ok(f"imported {n} server(s) from subscription")
+
+
+def cmd_proxy(action: str):
+    state = load_state()
+    if action == "on":
+        g = proxy_on(state)
+        ok("system proxy " + style("ON", GREEN, BOLD))
+        if g:
+            info("GNOME proxy set via gsettings")
+        info(f"for shells, run: {CYAN}source {ENV_PROXY_FILE}{RESET}")
+    elif action == "off":
+        proxy_off()
+        ok("system proxy " + style("OFF", RED, BOLD))
+        info(f"in current shell: {CYAN}unset http_proxy https_proxy all_proxy{RESET}")
+    else:
+        err("usage: proxy on|off")
+
+
+def cmd_logs(follow=False):
+    if not _have_systemd():
+        warn("systemd not available; no journald logs")
+        return
+    args = ["--user", "-u", UNIT_NAME, "-n", "40", "--no-pager"]
+    if follow:
+        args.append("-f")
+    try:
+        subprocess.run(["journalctl", *args])
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_config():
+    servers = load_servers()
+    state = load_state()
+    s = write_active_config(servers, state)
+    if not s:
+        warn("no active server")
+        return
+    with open(GEN_CONFIG) as f:
+        print(f.read())
+
+
+# --------------------------------------------------------------------------- #
+# Interactive shell (Claude-Code style)
+# --------------------------------------------------------------------------- #
+SLASH = {
+    "/add": "add a share link (vless/vmess/trojan/ss)",
+    "/list": "list saved servers",
+    "/ls": "list saved servers",
+    "/use": "set active server  ·  /use <name|#>",
+    "/start": "start the proxy service",
+    "/stop": "stop the proxy service",
+    "/restart": "restart the proxy service",
+    "/status": "show connection status",
+    "/test": "latency-test all servers",
+    "/fastest": "test and switch to the fastest server",
+    "/sub": "import a subscription URL  ·  /sub <url>",
+    "/proxy": "system proxy  ·  /proxy on|off",
+    "/remove": "delete a server  ·  /remove <name|#>",
+    "/logs": "show service logs",
+    "/config": "print generated xray config",
+    "/help": "show this help",
+    "/clear": "clear the screen",
+    "/exit": "quit",
+    "/quit": "quit",
+}
+
+
+def _banner():
+    v = xray_version()
+    vline = f"{GREEN}{v}{RESET}" if v else f"{RED}xray not installed{RESET}"
+    print()
+    print(box([
+        f"{ORANGE}{BOLD}xray-cli{RESET}  {DIM}interactive shell{RESET}",
+        "",
+        f"{GRAY}core:{RESET} {vline}",
+        f"{DIM}type {RESET}{CYAN}/help{RESET}{DIM} for commands, or paste a share link{RESET}",
+    ], color=ORANGE))
+    print()
+
+
+def _status_line():
+    state = load_state()
+    active = state.get("active")
+    running = service_active()
+    dot = f"{GREEN}●{RESET}" if running else f"{DIM}○{RESET}"
+    name = active or f"{DIM}no server{RESET}"
+    conn = f"{GREEN}connected{RESET}" if running else f"{DIM}stopped{RESET}"
+    return f"{dot} {name} {DIM}·{RESET} {conn}"
+
+
+def _completer(servers):
+    names = [s["tag"] for s in servers]
+
+    def complete(text, state_idx):
+        buf = _readline.get_line_buffer() if _readline else text
+        if buf.startswith("/") and " " not in buf:
+            opts = [c + " " for c in SLASH if c.startswith(text)]
+        else:
+            opts = [n for n in names if n.startswith(text)]
+        return opts[state_idx] if state_idx < len(opts) else None
+    return complete
+
+
+try:
+    import readline as _readline
+except ImportError:
+    _readline = None
+
+
+def _print_help():
+    rows = []
+    seen = set()
+    for cmd, desc in SLASH.items():
+        if desc in seen:
+            continue
+        seen.add(desc)
+        rows.append(f"{CYAN}{cmd:<10}{RESET} {DIM}{desc}{RESET}")
+    print(box(rows, title="commands", color=PURPLE))
+
+
+def repl():
+    _banner()
+    if _readline:
+        _readline.set_completer_delims(" ")
+        _readline.parse_and_bind("tab: complete")
+    while True:
+        if _readline:
+            _readline.set_completer(_completer(load_servers()))
+        try:
+            print(f"\n  {_status_line()}")
+            line = input(f"  {ORANGE}❯{RESET} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(f"\n{DIM}  bye{RESET}\n")
+            return
+        if not line:
+            continue
+        if "://" in line and not line.startswith("/"):
+            cmd_add(line.split())
+            continue
+        parts = line.split()
+        cmd, args = parts[0], parts[1:]
+        if not cmd.startswith("/"):
+            cmd = "/" + cmd
+        try:
+            if cmd in ("/exit", "/quit"):
+                print(f"{DIM}  bye{RESET}\n")
+                return
+            elif cmd == "/help":
+                _print_help()
+            elif cmd == "/clear":
+                os.system("clear")
+                _banner()
+            elif cmd == "/add":
+                cmd_add(args) if args else warn("usage: /add <link>")
+            elif cmd in ("/list", "/ls"):
+                cmd_list()
+            elif cmd == "/use":
+                cmd_use(args[0]) if args else warn("usage: /use <name|#>")
+            elif cmd == "/remove":
+                cmd_remove(args[0]) if args else warn("usage: /remove <name|#>")
+            elif cmd == "/start":
+                cmd_start()
+            elif cmd == "/stop":
+                cmd_stop()
+            elif cmd == "/restart":
+                cmd_restart()
+            elif cmd == "/status":
+                cmd_status()
+            elif cmd == "/test":
+                cmd_test(switch=False)
+            elif cmd == "/fastest":
+                cmd_test(switch=True)
+            elif cmd == "/sub":
+                cmd_sub(args[0]) if args else warn("usage: /sub <url>")
+            elif cmd == "/proxy":
+                cmd_proxy(args[0]) if args else warn("usage: /proxy on|off")
+            elif cmd == "/logs":
+                cmd_logs(follow=False)
+            elif cmd == "/config":
+                cmd_config()
+            else:
+                warn(f"unknown command {cmd} — try /help")
+        except Exception as e:
+            err(f"{type(e).__name__}: {e}")
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+def build_parser():
+    p = argparse.ArgumentParser(prog="xr", description="Friendly Xray-core CLI wrapper")
+    sub = p.add_subparsers(dest="cmd")
+    sp = sub.add_parser("add", help="add share link(s)")
+    sp.add_argument("links", nargs="+")
+    sub.add_parser("list", help="list servers")
+    sp = sub.add_parser("use", help="set active server")
+    sp.add_argument("ref")
+    sp = sub.add_parser("remove", help="remove a server")
+    sp.add_argument("ref")
+    sub.add_parser("start", help="start proxy")
+    sub.add_parser("stop", help="stop proxy")
+    sub.add_parser("restart", help="restart proxy")
+    sub.add_parser("status", help="show status")
+    sub.add_parser("test", help="latency test")
+    sub.add_parser("fastest", help="switch to fastest server")
+    sp = sub.add_parser("sub", help="import subscription URL")
+    sp.add_argument("url")
+    sp = sub.add_parser("proxy", help="system proxy on|off")
+    sp.add_argument("action", choices=["on", "off"])
+    lp = sub.add_parser("logs", help="show service logs")
+    lp.add_argument("-f", "--follow", action="store_true")
+    sub.add_parser("config", help="print generated xray config")
+    sub.add_parser("install-unit", help="(re)write the systemd user unit")
+    return p
+
+
+def main(argv=None):
+    argv = argv if argv is not None else sys.argv[1:]
+    if not argv:
+        repl()
+        return
+    args = build_parser().parse_args(argv)
+    dispatch = {
+        "add": lambda: cmd_add(args.links),
+        "list": cmd_list,
+        "use": lambda: cmd_use(args.ref),
+        "remove": lambda: cmd_remove(args.ref),
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "restart": cmd_restart,
+        "status": cmd_status,
+        "test": lambda: cmd_test(switch=False),
+        "fastest": lambda: cmd_test(switch=True),
+        "sub": lambda: cmd_sub(args.url),
+        "proxy": lambda: cmd_proxy(args.action),
+        "logs": lambda: cmd_logs(follow=args.follow),
+        "config": cmd_config,
+        "install-unit": write_unit,
+    }
+    fn = dispatch.get(args.cmd)
+    if fn:
+        fn()
+    else:
+        repl()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
