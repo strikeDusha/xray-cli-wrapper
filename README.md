@@ -17,7 +17,7 @@ proxy, and latency tests — with a Claude-Code-style interactive shell.
 ## Install
 
 ```bash
-git clone <this> xray-cli && cd xray-cli
+git clone https://github.com/strikeDusha/xray-cli-wrapper xray-cli && cd xray-cli
 ./install.sh            # copies `xr` to ~/.local/bin and writes the systemd unit
 ```
 
