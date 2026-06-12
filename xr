@@ -430,32 +430,52 @@ def _stream_settings(stream: dict) -> dict:
     return ss
 
 
-def build_outbound(server: dict) -> dict:
+# RFC1918 / loopback / link-local / ULA — kept direct without needing geoip.dat
+PRIVATE_CIDRS = [
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+    "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+]
+
+
+def build_outbound(server: dict, pin_ip: str | None = None) -> dict:
     proto = server["protocol"]
     stream = _stream_settings(server.get("stream", {"network": "tcp", "security": "none"}))
+    # When pinning to a literal IP (TUN mode), make sure TLS still validates against
+    # the original hostname rather than the bare IP.
+    if pin_ip and stream.get("security") == "tls":
+        ts = stream.setdefault("tlsSettings", {})
+        if not ts.get("serverName"):
+            host = server.get("address", "")
+            if host and not _is_ip(host):
+                ts["serverName"] = host
+    addr = pin_ip or server["address"]
     ob = {"tag": "proxy", "protocol": proto, "streamSettings": stream}
     if proto == "vless":
         user = {"id": server["id"], "encryption": server.get("encryption", "none")}
         if server.get("flow"):
             user["flow"] = server["flow"]
-        ob["settings"] = {"vnext": [{"address": server["address"],
+        ob["settings"] = {"vnext": [{"address": addr,
                                      "port": server["port"], "users": [user]}]}
     elif proto == "vmess":
-        ob["settings"] = {"vnext": [{"address": server["address"], "port": server["port"],
+        ob["settings"] = {"vnext": [{"address": addr, "port": server["port"],
                                      "users": [{"id": server["id"],
                                                 "alterId": server.get("alterId", 0),
                                                 "security": server.get("security", "auto")}]}]}
     elif proto == "trojan":
-        ob["settings"] = {"servers": [{"address": server["address"], "port": server["port"],
+        ob["settings"] = {"servers": [{"address": addr, "port": server["port"],
                                        "password": server["password"]}]}
     elif proto == "shadowsocks":
-        ob["settings"] = {"servers": [{"address": server["address"], "port": server["port"],
+        ob["settings"] = {"servers": [{"address": addr, "port": server["port"],
                                        "method": server["method"],
                                        "password": server["password"]}]}
     return ob
 
 
-def build_config(server: dict, state: dict) -> dict:
+def _stream_settings_for(server, pin_ip):
+    return build_outbound(server, pin_ip)["streamSettings"]
+
+
+def build_config(server: dict, state: dict, pin_ip: str | None = None) -> dict:
     listen = state.get("listen", "127.0.0.1")
     return {
         "log": {"loglevel": state.get("log_level", "warning")},
@@ -468,31 +488,45 @@ def build_config(server: dict, state: dict) -> dict:
              "protocol": "http", "settings": {}},
         ],
         "outbounds": [
-            build_outbound(server),
-            {"tag": "direct", "protocol": "freedom", "settings": {}},
+            build_outbound(server, pin_ip),
+            {"tag": "direct", "protocol": "freedom", "settings": {"domainStrategy": "UseIP"}},
             {"tag": "block", "protocol": "blackhole", "settings": {}},
         ],
         "routing": {
             "domainStrategy": "IPIfNonMatch",
             "rules": [
-                {"type": "field", "ip": ["geoip:private"], "outboundTag": "direct"},
+                # keep LAN / loopback off the tunnel (explicit CIDRs, no geoip.dat needed)
+                {"type": "field", "ip": PRIVATE_CIDRS, "outboundTag": "direct"},
             ],
         },
     }
 
 
-def write_active_config(servers, state) -> dict | None:
+def write_active_config(servers, state, pin_ip: str | None = None) -> dict | None:
     tag = state.get("active")
     if not tag:
         return None
     server = next((s for s in servers if s["tag"] == tag), None)
     if not server:
         return None
-    cfg = build_config(server, state)
+    cfg = build_config(server, state, pin_ip)
     _ensure_dirs()
     with open(GEN_CONFIG, "w") as f:
         json.dump(cfg, f, indent=2)
     return server
+
+
+def _is_ip(s: str) -> bool:
+    try:
+        socket.inet_pton(socket.AF_INET, s)
+        return True
+    except OSError:
+        pass
+    try:
+        socket.inet_pton(socket.AF_INET6, s)
+        return True
+    except OSError:
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -637,6 +671,82 @@ def _run_root_script(script: str) -> int:
     return subprocess.run(["sudo", "sh", "-c", script]).returncode
 
 
+# --- connectivity verification -------------------------------------------- #
+IP_ECHO_HOST = "api.ipify.org"  # plain-HTTP IP echo, reachable from the exit node
+
+
+def _recvn(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise OSError("connection closed mid-read")
+        buf += chunk
+    return buf
+
+
+def _socks5_connect(proxy_host, proxy_port, dest_host, dest_port, timeout=8.0):
+    s = socket.create_connection((proxy_host, proxy_port), timeout)
+    s.settimeout(timeout)
+    s.sendall(b"\x05\x01\x00")
+    if _recvn(s, 2) != b"\x05\x00":
+        s.close()
+        raise OSError("socks5 handshake failed")
+    h = dest_host.encode()
+    s.sendall(b"\x05\x01\x00\x03" + bytes([len(h)]) + h + int(dest_port).to_bytes(2, "big"))
+    rep = _recvn(s, 4)
+    if rep[1] != 0:
+        s.close()
+        raise OSError(f"socks5 connect rejected (code {rep[1]})")
+    atyp = rep[3]
+    if atyp == 1:        # IPv4
+        _recvn(s, 4)
+    elif atyp == 4:      # IPv6
+        _recvn(s, 16)
+    elif atyp == 3:      # domain
+        _recvn(s, _recvn(s, 1)[0])
+    _recvn(s, 2)         # bound port
+    return s
+
+
+def _http_get_ip(sock, host):
+    sock.sendall(f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+                 f"User-Agent: xray-cli\r\nConnection: close\r\n\r\n".encode())
+    data = b""
+    try:
+        while len(data) < 8192:
+            chunk = sock.recv(2048)
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        pass
+    finally:
+        sock.close()
+    body = data.split(b"\r\n\r\n", 1)[-1].decode("utf-8", "replace").strip()
+    body = body.splitlines()[-1].strip() if body else ""
+    return body if _is_ip(body) else None
+
+
+def egress_ip_via_socks(state, timeout=8.0):
+    """Exit IP as seen by xray's SOCKS inbound (proves the proxy core works)."""
+    try:
+        s = _socks5_connect(state["listen"], state["socks_port"], IP_ECHO_HOST, 80, timeout)
+        return _http_get_ip(s, IP_ECHO_HOST)
+    except Exception:
+        return None
+
+
+def egress_ip_via_os(timeout=8.0):
+    """Exit IP over the plain OS network path — through the TUN if it's up."""
+    try:
+        s = socket.create_connection((IP_ECHO_HOST, 80), timeout)
+        s.settimeout(timeout)
+        return _http_get_ip(s, IP_ECHO_HOST)
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Latency test (TCP connect time to server endpoint)
 # --------------------------------------------------------------------------- #
@@ -770,7 +880,10 @@ def cmd_use(ref: str):
     state["active"] = s["tag"]
     save_state(state)
     ok(f"active server → {style(s['tag'], BOLD)}")
-    if service_active():
+    if tun_active():
+        info("TUN mode is on — reconfiguring tunnel for the new server…")
+        _tun_on()  # re-resolves, re-pins, refreshes bypass routes
+    elif service_active():
         info("restarting service to apply…")
         cmd_restart()
     return True
@@ -825,6 +938,9 @@ def cmd_stop():
     if not _have_systemd():
         warn("systemd not available")
         return
+    if tun_active():
+        info("TUN mode is on — tearing it down first (avoids a dead-tunnel blackhole)…")
+        _tun_off()
     with Spinner("stopping xray"):
         _systemctl("disable", "--now", UNIT_NAME, capture=True)
         time.sleep(0.4)
@@ -956,13 +1072,21 @@ def _tun_status():
     on = tun_active()
     dot = f"{GREEN}● on{RESET}" if on else f"{DIM}○ off{RESET}"
     iface, gw = default_route()
+    v6 = f"{GREEN}blocked{RESET}" if st.get("ipv6_blocked") and on else f"{DIM}—{RESET}"
     lines = [
         f"{GRAY}tun mode {RESET}{dot}",
         f"{GRAY}device   {RESET}{TUN_DEV}  {DIM}{TUN_ADDR}{RESET}",
         f"{GRAY}via      {RESET}socks5 127.0.0.1:{load_state()['socks_port']} → tun2socks",
+        f"{GRAY}server   {RESET}{st.get('server', '—')} "
+        f"{DIM}pinned {st.get('pin_ip', '—')}{RESET}",
         f"{GRAY}bypass   {RESET}{', '.join(st.get('bypass', [])) or DIM + 'none' + RESET}",
+        f"{GRAY}ipv6     {RESET}{v6} {DIM}(kill-switch){RESET}",
         f"{GRAY}uplink   {RESET}{iface or '?'} {DIM}gw {gw or '?'}{RESET}",
     ]
+    if on:
+        with Spinner("checking exit IP"):
+            eip = egress_ip_via_os() or egress_ip_via_socks(load_state())
+        lines.insert(1, f"{GRAY}exit ip  {RESET}{style(eip, BOLD, GREEN) if eip else DIM + 'unknown' + RESET}")
     print(box(lines, title="tun", color=PURPLE))
 
 
@@ -987,72 +1111,124 @@ def _tun_on():
     if not server:
         err("no active server — pick one with `xr use <name>`")
         return
-    if not service_active():
-        info("xray service not running — starting it first…")
-        cmd_start()
-        if not service_active():
-            err("could not start xray; aborting tun setup")
-            return
 
     iface, gw = default_route()
     if not iface or not gw:
         err("could not detect the default route / gateway; is the network up?")
         return
 
-    with Spinner(f"resolving {server['address']}") as sp:
-        bypass = resolve_ips(server["address"])
+    # 1. Resolve the server to literal IPs *now*, while routing is still normal.
+    #    We pin xray to one of these IPs so it can never dial an address that
+    #    isn't in our bypass set (that would create a routing loop).
+    with Spinner(f"resolving {server['address']}"):
+        bypass = [server["address"]] if _is_ip(server["address"]) else resolve_ips(server["address"])
     if not bypass:
-        warn(f"could not resolve {server['address']} to an IPv4 address — "
-             "bypass route may be incomplete (continuing)")
+        err(f"could not resolve {server['address']} to an IPv4 address — "
+            "cannot establish a leak-free tunnel. Aborting.")
+        return
+    pin_ip = bypass[0]
+
+    # 2. (Re)write the pinned config and (re)start xray under it.
+    prev_bypass = load_tun_state().get("bypass", []) if tun_active() else []
+    write_active_config(servers, state, pin_ip=pin_ip)
+    write_unit()
+    with Spinner(f"starting xray (pinned to {pin_ip})"):
+        _systemctl("restart", UNIT_NAME, capture=True)
+        time.sleep(0.7)
+    if not service_active():
+        err("xray failed to start with the pinned config — check `xr logs`")
+        write_active_config(servers, state)  # restore unpinned
+        _systemctl("restart", UNIT_NAME, capture=True)
+        return
 
     socks = state["socks_port"]
     t2s = tun2socks_bin()
+    all_bypass = sorted(set(bypass) | set(prev_bypass))
     bypass_cmds = "\n".join(
-        f"ip route replace {ip}/32 via {gw} dev {iface}" for ip in bypass)
+        f"ip route replace {ip}/32 via {gw} dev {iface}" for ip in all_bypass)
 
+    # 3. Kernel setup — one batched sudo. Fail-closed: split routes point at the
+    #    tun, so if tun2socks dies traffic is dropped, not leaked.
     script = f"""set -e
 # --- tun device ---
 ip tuntap add mode tun dev {TUN_DEV} 2>/dev/null || true
 ip addr replace {TUN_ADDR} dev {TUN_DEV}
-ip link set dev {TUN_DEV} up
+ip link set dev {TUN_DEV} mtu 1500 up
 # --- relax reverse-path filtering so tun packets aren't dropped ---
 sysctl -wq net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
 sysctl -wq net.ipv4.conf.{iface}.rp_filter=0 2>/dev/null || true
-# --- bypass: proxy server reachable directly (no loop) ---
+sysctl -wq net.ipv4.conf.{TUN_DEV}.rp_filter=0 2>/dev/null || true
+# --- bypass: the proxy server stays reachable directly (no loop) ---
 {bypass_cmds}
-# --- split default into tun (wins over real default, leaves it intact) ---
+# --- split default into the tun (wins over the real default, leaves it intact) ---
 ip route replace 0.0.0.0/1 dev {TUN_DEV}
 ip route replace 128.0.0.0/1 dev {TUN_DEV}
-# --- run tun2socks as a transient root service (journald-logged) ---
+# --- IPv6 kill-switch: blackhole all v6 so it can't leak around the v4 tunnel ---
+ip -6 route replace blackhole ::/1 2>/dev/null || true
+ip -6 route replace blackhole 8000::/1 2>/dev/null || true
+# --- run tun2socks as a transient root service, auto-restarting (journald) ---
 systemctl reset-failed {TUN_UNIT} 2>/dev/null || true
-systemd-run --unit={TUN_UNIT} --collect --property=Restart=on-failure \\
-    {t2s} -device {TUN_DEV} -proxy socks5://127.0.0.1:{socks} -interface {iface}
-# --- DNS through the tunnel (back up the original once) ---
-[ -f /etc/resolv.conf.xrbak ] || cp /etc/resolv.conf /etc/resolv.conf.xrbak 2>/dev/null || true
-printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\n' > /etc/resolv.conf
+systemctl stop {TUN_UNIT} 2>/dev/null || true
+systemd-run --unit={TUN_UNIT} --collect \\
+    --property=Restart=always --property=RestartSec=2 \\
+    {t2s} -device {TUN_DEV} -proxy socks5://127.0.0.1:{socks} -interface {iface} \\
+    -loglevel warning
+# --- DNS through the tunnel; preserve a resolv.conf symlink if there is one ---
+if [ ! -e /etc/resolv.conf.xrbak ] && [ ! -L /etc/resolv.conf.xrbak ]; then
+    cp -P /etc/resolv.conf /etc/resolv.conf.xrbak 2>/dev/null || true
+fi
+rm -f /etc/resolv.conf
+printf 'nameserver 1.1.1.1\\nnameserver 8.8.8.8\\noptions edns0\\n' > /etc/resolv.conf
 """
-    with Spinner("configuring tun device + routes (sudo)"):
+    with Spinner("configuring tun device, routes + kill-switch (sudo)"):
         rc = _run_root_script(script)
     if rc != 0:
-        err("tun setup failed (see sudo/errors above)")
+        err("tun setup failed (see errors above) — rolling back")
+        _tun_off(silent=True)
         return
+
     _ensure_dirs()
     with open(TUN_STATE_FILE, "w") as f:
-        json.dump({"dev": TUN_DEV, "bypass": bypass, "iface": iface,
-                   "gw": gw, "server": server["tag"]}, f, indent=2)
-    time.sleep(0.5)
-    if tun_active():
-        ok(f"TUN mode {style('ON', GREEN, BOLD)} — whole system routed via "
-           f"{style(server['tag'], BOLD)}")
-        info("all apps now go through the tunnel; turn off with `xr tun off`")
+        json.dump({"dev": TUN_DEV, "bypass": all_bypass, "iface": iface, "gw": gw,
+                   "pin_ip": pin_ip, "server": server["tag"], "ipv6_blocked": True},
+                  f, indent=2)
+
+    # 4. Verify the device + service actually came up; otherwise roll back.
+    time.sleep(0.6)
+    if not tun_active():
+        err("tun2socks did not come up — rolling back. "
+            "Check `journalctl -u xray-cli-tun`")
+        _tun_off(silent=True)
+        return
+
+    # 5. Prove it: fetch our exit IP through xray's socks, and again over the
+    #    plain OS path (which must traverse the tun). Matching IPs = leak-free.
+    with Spinner("verifying tunnel (exit IP)"):
+        via_socks = egress_ip_via_socks(state)
+        via_os = egress_ip_via_os()
+
+    ok(f"TUN mode {style('ON', GREEN, BOLD)} — whole system routed via "
+       f"{style(server['tag'], BOLD)} {DIM}(pinned {pin_ip}){RESET}")
+    if via_socks and via_os and via_socks == via_os:
+        ok(f"verified: exit IP {style(via_os, BOLD, GREEN)} via tunnel "
+           f"{DIM}(socks & OS path agree — no leak){RESET}")
+    elif via_os:
+        warn(f"OS path exits via {style(via_os, BOLD)} "
+             f"{DIM}(socks reported {via_socks or '—'}; tunnel up but verify with `xr tun status`){RESET}")
+    elif via_socks:
+        warn(f"proxy core works (exit {via_socks}) but the OS-path check failed — "
+             "the IP-echo host may be unreachable; tunnel routes are in place")
     else:
-        err("tun2socks did not come up — check `journalctl --user -u xray-cli-tun` "
-            "or `sudo systemctl status xray-cli-tun`")
+        warn("could not confirm exit IP (echo host unreachable). Device + routes "
+             "are up and fail-closed; check `xr logs` / `xr tun status`")
+    info("kill-switch active: if the tunnel drops, traffic is blocked (not leaked). "
+         "Turn off with `xr tun off`")
 
 
-def _tun_off():
+def _tun_off(silent=False):
     if not shutil.which("ip"):
-        warn("iproute2 not available")
+        if not silent:
+            warn("iproute2 not available")
         return
     st = load_tun_state()
     bypass = st.get("bypass", [])
@@ -1062,19 +1238,32 @@ systemctl stop {TUN_UNIT} 2>/dev/null
 systemctl reset-failed {TUN_UNIT} 2>/dev/null
 ip route del 0.0.0.0/1 dev {TUN_DEV} 2>/dev/null
 ip route del 128.0.0.0/1 dev {TUN_DEV} 2>/dev/null
+ip -6 route del blackhole ::/1 2>/dev/null
+ip -6 route del blackhole 8000::/1 2>/dev/null
 {bypass_cmds}
 ip link set dev {TUN_DEV} down 2>/dev/null
 ip tuntap del mode tun dev {TUN_DEV} 2>/dev/null
-if [ -f /etc/resolv.conf.xrbak ]; then mv -f /etc/resolv.conf.xrbak /etc/resolv.conf; fi
+if [ -e /etc/resolv.conf.xrbak ] || [ -L /etc/resolv.conf.xrbak ]; then
+    rm -f /etc/resolv.conf
+    cp -P /etc/resolv.conf.xrbak /etc/resolv.conf 2>/dev/null
+    rm -f /etc/resolv.conf.xrbak
+fi
 true
 """
-    with Spinner("tearing down tun device + routes (sudo)"):
+    with Spinner("tearing down tun, routes + kill-switch (sudo)"):
         _run_root_script(script)
     try:
         os.remove(TUN_STATE_FILE)
     except FileNotFoundError:
         pass
-    ok(f"TUN mode {style('OFF', RED, BOLD)} — routing restored")
+    # restore the normal (unpinned) xray config so direct proxy use still works
+    servers, state = load_servers(), load_state()
+    if state.get("active"):
+        write_active_config(servers, state)
+        if service_active():
+            _systemctl("restart", UNIT_NAME, capture=True)
+    if not silent:
+        ok(f"TUN mode {style('OFF', RED, BOLD)} — routing, DNS & IPv6 restored")
 
 
 def cmd_logs(follow=False):

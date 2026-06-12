@@ -62,18 +62,9 @@ In the shell you can also just **paste a share link** with no command.
 
 ## TUN mode (transparent whole-system tunnel)
 
-`xr proxy` only redirects apps that honour the SOCKS/HTTP proxy. **TUN mode**
-captures *all* traffic at the kernel level — same approach as v2rayN, NekoBox
-and sing-box on Linux:
-
-1. A TUN device (`tun0`, `198.18.0.1/15`) becomes the system's route.
-2. [`tun2socks`](https://github.com/xjasonlyu/tun2socks) forwards that traffic
-   into xray's local SOCKS inbound.
-3. A `/32` **bypass route** sends xray's own connection to your proxy server out
-   the real interface, so it doesn't loop back into the tunnel.
-4. `0.0.0.0/1` + `128.0.0.0/1` "split-default" routes win over your real default
-   without deleting it, and DNS is pointed through the tunnel — so teardown
-   (`xr tun off`) restores everything cleanly.
+`xr proxy` only redirects apps that honour the SOCKS/HTTP proxy. **TUN mode** is
+a real, leak-free VPN: it captures *all* traffic at the kernel level — same
+approach as v2rayN, NekoBox and sing-box on Linux.
 
 ```bash
 yay -S tun2socks      # one-time: the AUR helper binary
@@ -82,11 +73,32 @@ xr tun status
 xr tun off
 ```
 
-tun2socks runs as a transient root service (`xray-cli-tun`), so logs are in
-`sudo systemctl status xray-cli-tun` / `journalctl -u xray-cli-tun`.
+How it works, and why it's solid:
 
-> Requires `tun2socks`, `iproute2`, and systemd — all standard on Arch. The
-> single `sudo` prompt covers device creation, routing, and DNS in one batch.
+1. A TUN device (`tun0`, `198.18.0.1/15`) becomes the system's route, and
+   [`tun2socks`](https://github.com/xjasonlyu/tun2socks) forwards that traffic
+   into xray's local SOCKS inbound.
+2. **No routing loop.** xray is *pinned* to the server's resolved IP (resolved
+   before routes change), and that IP gets a `/32` bypass route out the real
+   interface — so xray's own connection can never fold back into the tunnel,
+   even with CDN/multi-IP servers. TLS SNI is preserved when pinning.
+3. **Fail-closed kill-switch.** `0.0.0.0/1` + `128.0.0.0/1` split-default routes
+   win over your real default without deleting it. If tun2socks dies, packets
+   hit a downed device and are *dropped, not leaked* (it also auto-restarts).
+4. **No IPv6 leaks.** IPv6 is blackholed for the session so traffic can't slip
+   around the v4 tunnel.
+5. **No DNS leaks.** DNS is pointed at `1.1.1.1`/`8.8.8.8` through the tunnel; a
+   symlinked `/etc/resolv.conf` (systemd-resolved) is preserved and restored.
+6. **Verified.** After setup, `xr` fetches your exit IP through xray's SOCKS
+   *and* over the plain OS path; if they agree, the tunnel is confirmed
+   leak-free. `xr tun off` cleanly restores routing, DNS and IPv6.
+
+LAN/loopback stay direct automatically (more-specific link routes + explicit
+private-CIDR routing rules — no `geoip.dat` required).
+
+tun2socks runs as a transient root service (`xray-cli-tun`); logs via
+`journalctl -u xray-cli-tun`. Everything privileged happens in one batched
+`sudo` call. Requires `tun2socks`, `iproute2` and systemd — all standard on Arch.
 
 ## System proxy
 
