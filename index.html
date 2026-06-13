@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>v3xtun — tun2proxy + xray</title>
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="dot" id="brand-dot"></span>
+          <span>v3xtun</span>
+        </div>
+        <nav>
+          <button class="nav-item active" data-tab="dashboard">Панель</button>
+          <button class="nav-item" data-tab="xray">Конфиг xray</button>
+          <button class="nav-item" data-tab="routing">Маршрутизация</button>
+          <button class="nav-item" data-tab="logs">Логи</button>
+          <button class="nav-item" data-tab="settings">Настройки</button>
+        </nav>
+        <div class="sidebar-footer">
+          <div class="status-line"><span>xray</span><span class="pill" id="pill-xray">стоп</span></div>
+          <div class="status-line"><span>tun2proxy</span><span class="pill" id="pill-t2p">стоп</span></div>
+        </div>
+      </aside>
+
+      <main class="content">
+        <!-- Dashboard -->
+        <section class="tab active" data-tab="dashboard">
+          <h1>Панель управления</h1>
+          <div class="cards">
+            <div class="card">
+              <div class="card-head"><h3>xray</h3><span class="pill" id="card-xray">стоп</span></div>
+              <p class="muted">Локальный SOCKS5-прокси для исходящих соединений.</p>
+              <div class="row">
+                <button id="btn-xray-start" class="primary">Запустить</button>
+                <button id="btn-xray-stop" class="ghost">Остановить</button>
+              </div>
+            </div>
+            <div class="card">
+              <div class="card-head"><h3>tun2proxy</h3><span class="pill" id="card-t2p">стоп</span></div>
+              <p class="muted">TUN-интерфейс, заворачивает системный трафик в SOCKS5.</p>
+              <div class="row">
+                <button id="btn-t2p-start" class="primary">Запустить</button>
+                <button id="btn-t2p-stop" class="ghost">Остановить</button>
+              </div>
+              <div id="caps-warn" class="warn hidden">
+                ⚠ У бинаря tun2proxy нет cap_net_admin — запуск без root невозможен.
+                <button id="btn-grant" class="link">Выдать права</button>
+              </div>
+            </div>
+          </div>
+          <div class="bigrow">
+            <button id="btn-connect" class="connect">Подключить всё</button>
+            <button id="btn-disconnect" class="connect off">Отключить всё</button>
+          </div>
+        </section>
+
+        <!-- Xray config -->
+        <section class="tab" data-tab="xray">
+          <h1>Конфиг xray</h1>
+          <p class="muted">JSON-конфигурация xray. SOCKS5-инбаунд должен совпадать с адресом прокси на вкладке «Маршрутизация».</p>
+          <textarea id="xray-config" spellcheck="false"></textarea>
+          <div class="row">
+            <button id="btn-config-save" class="primary">Сохранить</button>
+            <button id="btn-config-format" class="ghost">Форматировать</button>
+            <button id="btn-config-reset" class="ghost">Шаблон по умолчанию</button>
+            <span id="config-status" class="muted"></span>
+          </div>
+        </section>
+
+        <!-- Routing -->
+        <section class="tab" data-tab="routing">
+          <h1>Маршрутизация tun2proxy</h1>
+          <div class="form">
+            <label>Адрес прокси (SOCKS5/HTTP)
+              <input id="r-proxy" type="text" placeholder="socks5://127.0.0.1:10808" />
+            </label>
+            <label>Имя TUN-интерфейса
+              <input id="r-tun" type="text" placeholder="tun0" />
+            </label>
+            <label>Режим DNS
+              <select id="r-dns">
+                <option value="virtual">virtual (рекомендуется)</option>
+                <option value="over-tcp">over-tcp</option>
+                <option value="direct">direct</option>
+              </select>
+            </label>
+            <label>IP DNS-сервера (опционально)
+              <input id="r-dnsaddr" type="text" placeholder="8.8.8.8" />
+            </label>
+            <label class="full">Bypass (IP/CIDR/хостнеймы вашего сервера, по одному в строке) — чтобы трафик к прокси-серверу не уходил в петлю
+              <textarea id="r-bypass" rows="4" placeholder="example-server.com&#10;1.2.3.4"></textarea>
+            </label>
+            <label class="checkline">
+              <input id="r-ipv6" type="checkbox" /> Включить IPv6 в туннеле
+            </label>
+            <label class="checkline">
+              <input id="r-pkexec" type="checkbox" /> Запускать через pkexec (если не выданы capabilities)
+            </label>
+          </div>
+          <div class="row">
+            <button id="btn-routing-save" class="primary">Сохранить</button>
+            <button id="btn-bypass-extract" class="ghost">Извлечь адреса сервера из конфига xray</button>
+            <span id="routing-status" class="muted"></span>
+          </div>
+        </section>
+
+        <!-- Logs -->
+        <section class="tab" data-tab="logs">
+          <h1>Логи</h1>
+          <div class="row">
+            <select id="log-source">
+              <option value="xray">xray</option>
+              <option value="tun2proxy">tun2proxy</option>
+            </select>
+            <button id="btn-log-clear" class="ghost">Очистить</button>
+            <label class="checkline"><input id="log-autoscroll" type="checkbox" checked /> Автопрокрутка</label>
+          </div>
+          <pre id="log-view"></pre>
+        </section>
+
+        <!-- Settings -->
+        <section class="tab" data-tab="settings">
+          <h1>Настройки</h1>
+          <div class="form">
+            <label>Путь к бинарю xray
+              <input id="s-xray" type="text" placeholder="xray" />
+            </label>
+            <label>Путь к бинарю tun2proxy
+              <input id="s-t2p" type="text" placeholder="tun2proxy-bin" />
+            </label>
+            <label class="checkline">
+              <input id="s-autostart" type="checkbox" /> Автозапуск приложения при входе в систему
+            </label>
+            <label class="checkline">
+              <input id="s-tray" type="checkbox" /> Сворачивать в трей при закрытии окна
+            </label>
+            <label class="checkline">
+              <input id="s-autoconnect" type="checkbox" /> Подключать всё при запуске приложения
+            </label>
+          </div>
+          <div class="row">
+            <button id="btn-settings-save" class="primary">Сохранить</button>
+            <button id="btn-caps-check" class="ghost">Проверить capabilities tun2proxy</button>
+            <span id="settings-status" class="muted"></span>
+          </div>
+          <p class="muted small">Конфигурация хранится в каталоге настроек приложения. tun2proxy требует CAP_NET_ADMIN: проще всего разово выдать
+            capability через кнопку на «Панели», тогда root при каждом запуске не нужен.</p>
+        </section>
+      </main>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,128 +1,114 @@
-# xr — a friendly Xray-core CLI/TUI for Arch
+# v3xtun
 
-A single-file, **stdlib-only** Python wrapper around [Xray-core](https://github.com/XTLS/Xray-core).
-It manages saved servers, subscriptions, a `systemd --user` service, the system
-proxy, and latency tests — with a Claude-Code-style interactive shell.
+GUI-обёртка над **tun2proxy** и **xray** для Arch Linux (KDE Plasma / Wayland).
+Графический интерфейс на **Tauri 2** (Rust + TypeScript): запуск/остановка, редактор
+конфига xray, настройка маршрутизации tun2proxy и системный трей. После установки
+доступна командой `v3xtun` из консоли.
 
-```
-╭─ xray-cli  interactive shell ─────────────────────╮
-│  core: Xray 1.8.x ...                             │
-│  type /help for commands, or paste a share link   │
-╰───────────────────────────────────────────────────╯
+> Раньше в этом репозитории жил Python-CLI `xr`. Он остаётся в истории git; актуальный
+> проект — графический **v3xtun**.
 
-  ● tokyo-reality · connected
-  ❯ /fastest
-```
-
-## Install
+## Быстрый старт
 
 ```bash
-git clone https://github.com/strikeDusha/xray-cli-wrapper xray-cli && cd xray-cli
-./install.sh            # copies `xr` to ~/.local/bin and writes the systemd unit
+git clone https://github.com/strikeDusha/xray-cli-wrapper.git
+cd xray-cli-wrapper
+./install.sh          # соберёт релиз и поставит команду `v3xtun` в ~/.local/bin
+v3xtun                # запуск GUI (или иконка в меню приложений)
 ```
 
-You also need Xray-core itself:
+`./install.sh` сам проверит зависимости и подскажет команду `pacman`, если чего-то не хватает.
+
+## Как это работает
+
+```
+системный трафик ─▶ TUN (tun2proxy) ─▶ SOCKS5 127.0.0.1:10808 (xray inbound) ─▶ ваш сервер (xray outbound)
+```
+
+- **xray** запускается от пользователя и поднимает локальный SOCKS5-инбаунд.
+- **tun2proxy** создаёт TUN-интерфейс и заворачивает весь трафик ОС в этот SOCKS5.
+- IP вашего сервера обязательно попадает в **bypass**, иначе исходящее соединение xray
+  к серверу само уйдёт в туннель → петля. На вкладке «Маршрутизация» есть кнопка
+  «Извлечь адреса сервера из конфига» (хостнеймы резолвятся в IP при старте).
+
+Подробности архитектуры — в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Зависимости (Arch)
 
 ```bash
-sudo pacman -S xray     # community repo
-# or
-yay -S xray-bin         # AUR
+# рантайм
+sudo pacman -S xray            # или: yay -S xray-bin
+yay -S tun2proxy               # ставит бинарь tun2proxy-bin
+
+# сборка
+sudo pacman -S --needed rust nodejs npm webkit2gtk-4.1 \
+               base-devel libappindicator-gtk3 librsvg patchelf
 ```
 
-## Usage
+> Если бинарь tun2proxy называется иначе, укажите путь в «Настройки → Путь к бинарю tun2proxy».
 
-Run `xr` with no arguments for the **interactive shell**, or use subcommands.
-
-| Shell command | CLI equivalent | What it does |
-|---|---|---|
-| `/add <link>` | `xr add <link…>` | Add `vless://`, `vmess://`, `trojan://`, `ss://` links |
-| `/list` | `xr list` | List saved servers (● = active) |
-| `/use <name\|#>` | `xr use <ref>` | Set the active server (restarts if running) |
-| `/start` `/stop` `/restart` | `xr start` … | Control the `systemd --user` service |
-| `/status` | `xr status` | Connection state, ports, xray version |
-| `/test` | `xr test` | TCP latency-probe every server, sorted |
-| `/fastest` | `xr fastest` | Probe and switch to the lowest-latency server |
-| `/sub <url>` | `xr sub <url>` | Import a base64 subscription URL |
-| `/proxy on\|off` | `xr proxy on` | Toggle GNOME + shell env proxy |
-| `/tun on\|off\|status` | `xr tun on` | **Whole-system TUN tunnel** (all apps, no per-app proxy) |
-| `/remove <name\|#>` | `xr remove <ref>` | Delete a server |
-| `/logs` | `xr logs [-f]` | journald logs for the service |
-| `/config` | `xr config` | Print the generated `config.json` |
-
-In the shell you can also just **paste a share link** with no command.
-
-## How it works
-
-- Inbound: SOCKS5 on `127.0.0.1:10808` + HTTP on `127.0.0.1:10809`.
-- Each server is parsed into a normalized record and compiled into a real
-  Xray outbound (handles tcp/ws/grpc/http, and tls/reality/none security,
-  including VLESS-Reality + `xtls-rprx-vision` flow).
-- The active config is written to `~/.config/xray-cli/config.json` and run by
-  a generated `~/.config/systemd/user/xray-cli.service`.
-
-## TUN mode (transparent whole-system tunnel)
-
-`xr proxy` only redirects apps that honour the SOCKS/HTTP proxy. **TUN mode** is
-a real, leak-free VPN: it captures *all* traffic at the kernel level — same
-approach as v2rayN, NekoBox and sing-box on Linux.
+## Консольные команды
 
 ```bash
-yay -S tun2socks      # one-time: the AUR helper binary
-xr tun on             # asks for sudo once (needs root for ip/route/tun2socks)
-xr tun status
-xr tun off
+v3xtun            # запустить графический интерфейс
+v3xtun --help     # справка
+v3xtun --version  # версия
 ```
 
-How it works, and why it's solid:
+## Скрипты
 
-1. A TUN device (`tun0`, `198.18.0.1/15`) becomes the system's route, and
-   [`tun2socks`](https://github.com/xjasonlyu/tun2socks) forwards that traffic
-   into xray's local SOCKS inbound.
-2. **No routing loop.** xray is *pinned* to the server's resolved IP (resolved
-   before routes change), and that IP gets a `/32` bypass route out the real
-   interface — so xray's own connection can never fold back into the tunnel,
-   even with CDN/multi-IP servers. TLS SNI is preserved when pinning.
-3. **Fail-closed kill-switch.** `0.0.0.0/1` + `128.0.0.0/1` split-default routes
-   win over your real default without deleting it. If tun2socks dies, packets
-   hit a downed device and are *dropped, not leaked* (it also auto-restarts).
-4. **No IPv6 leaks.** IPv6 is blackholed for the session so traffic can't slip
-   around the v4 tunnel.
-5. **No DNS leaks.** DNS is pointed at `1.1.1.1`/`8.8.8.8` through the tunnel; a
-   symlinked `/etc/resolv.conf` (systemd-resolved) is preserved and restored.
-6. **Verified.** After setup, `xr` fetches your exit IP through xray's SOCKS
-   *and* over the plain OS path; if they agree, the tunnel is confirmed
-   leak-free. `xr tun off` cleanly restores routing, DNS and IPv6.
+| Скрипт | Назначение |
+|---|---|
+| `./install.sh`   | собрать релиз и установить команду `v3xtun` + ярлык |
+| `./run.sh`       | dev-режим с hot-reload (`tauri dev`) |
+| `./uninstall.sh` | удалить команду, ярлык и иконку |
 
-LAN/loopback stay direct automatically (more-specific link routes + explicit
-private-CIDR routing rules — no `geoip.dat` required).
-
-tun2socks runs as a transient root service (`xray-cli-tun`); logs via
-`journalctl -u xray-cli-tun`. Everything privileged happens in one batched
-`sudo` call. Requires `tun2socks`, `iproute2` and systemd — all standard on Arch.
-
-## System proxy
-
-`xr proxy on` sets GNOME proxy via `gsettings` and writes
-`~/.config/xray-cli/proxy.env`. For your current shell:
+Ручная сборка бандлов (`.AppImage` / `.deb` / `.rpm`):
 
 ```bash
-source ~/.config/xray-cli/proxy.env   # on
-unset http_proxy https_proxy all_proxy ALL_PROXY  # off
+npm install && npm run tauri build
+# артефакты: src-tauri/target/release/bundle/
 ```
 
-## Files
+## Права (CAP_NET_ADMIN)
+
+tun2proxy создаёт TUN и правит маршруты — нужен `CAP_NET_ADMIN`. Два варианта:
+
+1. **Рекомендуется — capability на бинарь (без root в рантайме).**
+   На «Панели» нажмите **«Выдать права»** — разово выполнится через `pkexec`:
+   ```bash
+   sudo setcap cap_net_admin,cap_net_raw+ep $(command -v tun2proxy-bin)
+   ```
+   После этого старт/стоп надёжны: остановка идёт через `SIGTERM`, tun2proxy сам
+   корректно восстанавливает маршруты и DNS (`SIGKILL` бы их подвесил).
+
+2. **Через pkexec при каждом запуске.** Галочка «Запускать через pkexec» на вкладке
+   «Маршрутизация». Запрос пароля при каждом старте; остановка root-процесса менее
+   надёжна — вариант 1 предпочтительнее.
+
+## Конфигурация
+
+Файлы — в `~/.config/dev.v3xtun.app/`:
+
+- `settings.json` — настройки приложения и tun2proxy;
+- `xray-config.json` — конфиг xray (вкладка «Конфиг xray»).
+
+Шаблон по умолчанию — VLESS + Reality; замените `YOUR_*` своими данными.
+
+## Структура
 
 ```
-~/.config/xray-cli/servers.json     saved servers
-~/.config/xray-cli/state.json       active server + settings
-~/.config/xray-cli/config.json      generated xray config (live)
-~/.config/xray-cli/tun.json         active TUN state (device + bypass routes)
-~/.config/systemd/user/xray-cli.service
+index.html, src/        фронтенд (TypeScript + Vite)
+src-tauri/src/
+  process.rs            запуск/остановка/мониторинг xray и tun2proxy, логи
+  config.rs             настройки, конфиг xray, сборка команд, capabilities, автозапуск
+  commands.rs           команды Tauri
+  tray.rs               системный трей
+  lib.rs / main.rs      сборка приложения + CLI (--help/--version)
+install.sh, run.sh, uninstall.sh
+docs/ARCHITECTURE.md
 ```
 
-## Notes
+## Лицензия
 
-- Latency test uses a TCP-connect handshake to the server endpoint — fast and
-  doesn't require the tunnel to be up.
-- No external Python packages. Colors disable automatically when piped or with
-  `NO_COLOR=1`.
+MIT.
