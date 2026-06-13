@@ -109,6 +109,34 @@ install.sh, run.sh, uninstall.sh
 docs/ARCHITECTURE.md
 ```
 
+## Решение проблем
+
+### `Gdk-Message: Error 71 (Protocol error) dispatching to wayland display`
+
+Окно не открывается на Wayland (частая беда WebKitGTK на KDE Plasma). v3xtun уже
+выставляет `WEBKIT_DISABLE_DMABUF_RENDERER=1` сам при старте. Если этого мало,
+попробуйте по очереди:
+
+```bash
+# 1) отключить также композитинг WebKitGTK
+WEBKIT_DISABLE_COMPOSITING_MODE=1 v3xtun
+
+# 2) принудительно запустить через XWayland (почти всегда срабатывает на KDE)
+GDK_BACKEND=x11 v3xtun
+```
+
+Чтобы закрепить рабочий вариант, допишите переменную в `Exec=` файла
+`~/.local/share/applications/v3xtun.desktop` и в `~/.local/bin/v3xtun` (если делали
+обёртку), либо экспортируйте в `~/.config/environment.d/` /  `~/.bashrc`.
+
+> На NVIDIA с проприетарным драйвером под Wayland надёжнее всего вариант с
+> `GDK_BACKEND=x11`.
+
+### `cargo: command not found` / ошибки `webkit2gtk-4.1`
+
+Не установлены зависимости сборки — см. раздел «Зависимости (Arch)».
+`./install.sh` тоже выводит точную команду `pacman`.
+
 ## Лицензия
 
 MIT.
