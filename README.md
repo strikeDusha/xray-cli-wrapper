@@ -55,6 +55,29 @@ v3xtun --help     # справка
 v3xtun --version  # версия
 ```
 
+## Версия без GUI — `v3xtun.sh` (чистый Bash)
+
+Если не нужен графический интерфейс (сервер, SSH, headless), есть консольный
+двойник на чистом Bash — **`v3xtun.sh`**. Тот же стек (xray + tun2proxy), без
+сборки Rust/Node: нужны только `jq`, `xray`, `tun2proxy` и `curl`.
+
+```bash
+./v3xtun.sh                      # интерактивная оболочка (в стиле Claude Code)
+./v3xtun.sh add "vless://…"      # добавить сервер по ссылке (vless/vmess/trojan/ss)
+./v3xtun.sh tun on               # включить VPN на всю систему (tun2proxy --setup)
+./v3xtun.sh status               # статус, exit-IP, порты
+./v3xtun.sh --help
+```
+
+Что делает: парсит share-ссылки и подписки, генерирует конфиг xray, поднимает
+его как `systemd --user` сервис, переключает системный прокси, и включает
+**TUN-режим через tun2proxy** с теми же гарантиями, что и GUI — пиннинг IP
+сервера, `--bypass` на адрес сервера (без петли), virtual-DNS (без утечек) и
+проверкой exit-IP после включения. Если на `tun2proxy` выдан `cap_net_admin`
+(кнопка «Выдать права» в GUI или `setcap`), TUN поднимается **без root**.
+
+Свой конфиг хранит в `~/.config/v3xtun/` (отдельно от GUI, чтобы не пересекаться).
+
 ## Скрипты
 
 | Скрипт | Назначение |
@@ -62,6 +85,7 @@ v3xtun --version  # версия
 | `./install.sh`   | собрать релиз и установить команду `v3xtun` + ярлык |
 | `./run.sh`       | dev-режим с hot-reload (`tauri dev`) |
 | `./uninstall.sh` | удалить команду, ярлык и иконку |
+| `./v3xtun.sh`    | консольная версия на Bash (без сборки, нужен `jq`) |
 
 Ручная сборка бандлов (`.AppImage` / `.deb` / `.rpm`):
 
